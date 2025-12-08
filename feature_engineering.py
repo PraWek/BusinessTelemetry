@@ -53,7 +53,11 @@ def compute_basket_size_and_avg_time(df: pd.DataFrame, session_col: str = "sessi
     """
     - product_to_cart внутри сессии (1/0)
     - basket_size: количество product->cart событий в сессии
-    - avg_time_between_cart_and_checkout: в секундах для сессии (см. ниже)
+    - avg_time_between_cart_and_checkout: в секундах для сессии
+
+    Исправлено: среднее время считается ТОЛЬКО для переходов cart -> checkout.
+    Ранее использовался diff() по всем cart/checkout событиям, что включало
+    checkout->checkout и искажало метрику.
     """
     df = df.copy()
     if ts_col in df.columns and not pd.api.types.is_datetime64_any_dtype(df[ts_col]):
@@ -66,16 +70,26 @@ def compute_basket_size_and_avg_time(df: pd.DataFrame, session_col: str = "sessi
     df["basket_size"] = df.groupby(session_col)["product_to_cart"].transform("sum")
 
     # average time between cart and next checkout inside session
+    # только учитываем пары cart -> checkout
     df_cart_checkout = df[df["action"].isin(["cart", "checkout"])].copy()
     df_cart_checkout = df_cart_checkout.sort_values([session_col, ts_col])
-    # diff gives time since previous cart/checkout in same session
-    df_cart_checkout["time_since_prev"] = df_cart_checkout.groupby(session_col)[ts_col].diff().dt.total_seconds()
-    # For checkout rows, time_since_prev represents time from previous cart/checkout to checkout.
-    avg_time = (
-        df_cart_checkout[df_cart_checkout["action"] == "checkout"]
-        .groupby(session_col)["time_since_prev"]
-        .mean()
+
+    # prev action and prev timestamp inside session (only among cart/checkout rows)
+    df_cart_checkout["prev_action_in_session"] = df_cart_checkout.groupby(session_col)["action"].shift(1)
+    df_cart_checkout["prev_ts_in_session"] = df_cart_checkout.groupby(session_col)[ts_col].shift(1)
+
+    # Рассчитываем время ТОЛЬКО для строк, где текущий action == 'checkout' и prev_action == 'cart'
+    mask_cart_to_checkout = (
+        (df_cart_checkout["action"] == "checkout") & (df_cart_checkout["prev_action_in_session"] == "cart")
     )
+    # создаём колонку, содержащую время в секундах только для пар cart->checkout
+    df_cart_checkout.loc[mask_cart_to_checkout, "time_from_cart_to_checkout"] = (
+        df_cart_checkout.loc[mask_cart_to_checkout, ts_col] - df_cart_checkout.loc[mask_cart_to_checkout, "prev_ts_in_session"]
+    ).dt.total_seconds()
+
+    # Усредняем только по этим корректным парам
+    avg_time = df_cart_checkout.groupby(session_col)["time_from_cart_to_checkout"].mean()
+
     df["avg_time_between_cart_and_checkout"] = df[session_col].map(avg_time).fillna(0)
     return df
 

@@ -49,11 +49,11 @@ def compute_funnel(
         actions = list(sgrp["action"])
         user = sgrp[userid_col].iloc[0] if userid_col in sgrp.columns else None
         pos = 0
-        reached = set()
+        reached = list()
         for step in steps:
             try:
                 i = actions.index(step, pos)
-                reached.add(step)
+                reached.append(step)
                 pos = i + 1
             except ValueError:
                 break
@@ -81,27 +81,23 @@ def compute_kpis_by_date(
     orders_action: str = "checkout",
     confirmation_col: Optional[str] = "confirmation"
 ) -> pd.DataFrame:
-    """
-    Возвращает DataFrame с KPI по дням:
-      - gmv (sum checkout_value)
-      - orders_count (по action == orders_action или confirmation_col)
-      - buyers_count (unique userid)
-      - sessions_count (unique sessionid)
-      - aov (gmv / orders_count, безопасно)
-      - dau
-    Ожидается, что df[date_col] — либо python date, либо datetime (будет преобразовано в date).
-    """
+
     df_local = df.copy()
-    # ensure date_col is date
+
     if date_col in df_local.columns and pd.api.types.is_datetime64_any_dtype(df_local[date_col]):
         df_local[date_col] = df_local[date_col].dt.date
     elif date_col not in df_local.columns and "timestamp" in df_local.columns:
         df_local[date_col] = df_local["timestamp"].dt.date
 
-    # orders
     if confirmation_col and confirmation_col in df_local.columns:
-        orders_series = df_local[confirmation_col].astype(bool)
-        orders = df_local.loc[orders_series].groupby(date_col).size().rename("orders_count").reset_index()
+        orders_mask = df_local[confirmation_col].astype(bool)
+        orders = (
+            df_local.loc[orders_mask]
+            .groupby(date_col)
+            .size()
+            .rename("orders_count")
+            .reset_index()
+        )
     else:
         orders = (
             df_local.groupby(date_col)
@@ -110,18 +106,55 @@ def compute_kpis_by_date(
             .reset_index()
         )
 
-    gmv = df_local.groupby(date_col)["checkout_value"].sum().reset_index(name="gmv")
-    sessions = df_local.groupby(date_col)["sessionid"].nunique().reset_index(name="sessions_count")
-    buyers = df_local.groupby(date_col)["userid"].nunique().reset_index(name="buyers_count")
-    dau = df_local.groupby(date_col)["userid"].nunique().reset_index(name="dau")
+    gmv = (
+        df_local.groupby(date_col)["checkout_value"]
+        .sum()
+        .reset_index(name="gmv")
+    )
 
-    kpis = orders.merge(gmv, on=date_col, how="outer").merge(sessions, on=date_col, how="outer").merge(buyers, on=date_col, how="outer")
-    kpis = kpis.merge(dau, on=date_col, how="left")
-    kpis = kpis.fillna({ "orders_count": 0, "gmv": 0, "sessions_count": 0, "buyers_count": 0, "dau": 0 })
+    sessions = (
+        df_local.groupby(date_col)["sessionid"]
+        .nunique()
+        .reset_index(name="sessions_count")
+    )
 
-    # safe AOV
+    if confirmation_col and confirmation_col in df_local.columns:
+        buyers_mask = df_local[confirmation_col].astype(bool)
+    else:
+        buyers_mask = df_local["action"] == orders_action
+
+    buyers = (
+        df_local.loc[buyers_mask]
+        .groupby(date_col)["userid"]
+        .nunique()
+        .reset_index(name="buyers_count")
+    )
+
+    dau = (
+        df_local.groupby(date_col)["userid"]
+        .nunique()
+        .reset_index(name="dau")
+    )
+
+    kpis = (
+        orders.merge(gmv, on=date_col, how="outer")
+        .merge(sessions, on=date_col, how="outer")
+        .merge(buyers, on=date_col, how="outer")
+        .merge(dau, on=date_col, how="outer")
+    )
+
+    kpis = kpis.fillna({
+        "orders_count": 0,
+        "gmv": 0,
+        "sessions_count": 0,
+        "buyers_count": 0,
+        "dau": 0,
+    })
+
     kpis["aov"] = kpis.apply(lambda r: safe_divide(r["gmv"], r["orders_count"]), axis=1)
+
     return kpis
+
 
 
 def compute_sankey_transitions(
@@ -157,32 +190,60 @@ def compute_sankey_transitions(
     return sankey
 
 
-def compute_conversion_daily(df: pd.DataFrame, steps: List[str], date_col: str = "date") -> pd.DataFrame:
-    """
-    Для списка steps (в порядке) вычисляет дневные количества уникальных пользователей на каждом шаге
-    и конверсии между соседними шагами, а также полную конверсию (последний/первый).
-    Возвращает DataFrame с date и CR колонками. Если denominator == 0 -> NaN.
-    """
+def compute_conversion_daily(
+    df: pd.DataFrame,
+    steps: List[str],
+    date_col: str = "date",
+    ts_col: str = "timestamp"
+) -> pd.DataFrame:
+
     df_local = df.copy()
-    if date_col in df_local.columns and pd.api.types.is_datetime64_any_dtype(df_local[date_col]):
-        df_local[date_col] = df_local[date_col].dt.date
-    elif date_col not in df_local.columns and "timestamp" in df_local.columns:
-        df_local[date_col] = df_local["timestamp"].dt.date
+    df_local[ts_col] = pd.to_datetime(df_local[ts_col])
+    df_local[date_col] = df_local[ts_col].dt.date
 
     df_f = df_local[df_local["action"].isin(steps)].copy()
-    daily_steps = df_f.groupby([date_col, "action"])["userid"].nunique().reset_index()
-    pivot = daily_steps.pivot(index=date_col, columns="action", values="userid").fillna(0)
-    # ensure all steps exist
-    for s in steps:
-        if s not in pivot.columns:
-            pivot[s] = 0
-    pivot = pivot[steps]  # re-order columns to match steps
 
-    out = pivot.reset_index()
-    # compute ratios
-    for i in range(len(steps) - 1):
-        a = steps[i]
-        b = steps[i + 1]
-        out[f"cr_{a}_to_{b}"] = out.apply(lambda r: safe_divide(r[b], r[a]), axis=1)
-    out["cr_full"] = out.apply(lambda r: safe_divide(r[steps[-1]], r[steps[0]]), axis=1)
-    return out
+    first_step = steps[0]
+
+    df_first = df_f[df_f["action"] == first_step].copy()
+    df_first = df_first.sort_values(ts_col)
+
+    # timestamp + cohort date
+    first_ts = df_first.groupby("userid")[ts_col].first().reset_index()
+    first_day = df_first.groupby("userid")[date_col].first().reset_index()
+
+    cohort = (
+        first_ts.merge(first_day, on="userid")
+        .rename(columns={
+            ts_col: "first_ts",
+            date_col: "cohort_date"     # <-- Исправлено
+        })
+    )
+
+    # merge all events of cohort users
+    df_join = df_f.merge(cohort, on="userid")
+
+    # keep only events after first step
+    df_join = df_join[df_join[ts_col] >= df_join["first_ts"]]
+
+    # true conversion: by cohort_date
+    res = (
+        df_join.groupby(["cohort_date", "action"])["userid"]
+        .nunique()
+        .unstack(fill_value=0)
+    )
+
+    # ensure columns exist
+    for s in steps:
+        if s not in res.columns:
+            res[s] = 0
+
+    res = res[steps].reset_index()
+
+    # ratios
+    for a, b in zip(steps[:-1], steps[1:]):
+        res[f"cr_{a}_to_{b}"] = res[b] / res[a]
+
+    res["cr_full"] = res[steps[-1]] / res[first_step]
+
+    return res
